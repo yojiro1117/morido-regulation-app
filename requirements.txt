@@ -1,0 +1,6 @@
+streamlit
+pandas
+pdfplumber
+ezdxf
+fpdf2
+openpyxl
