@@ -3,215 +3,245 @@ import pandas as pd
 import io
 import re
 import time
-
+from datetime import datetime
 try:
     import pdfplumber
 except ImportError:
     pdfplumber = None
-
 try:
     import ezdxf
 except ImportError:
     ezdxf = None
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
-from fpdf import FPDF
-
-# guidelines dictionary for area and height thresholds
-GUIDELINES = {
-    "default": {
-        "area_threshold": 500,  # 500 square meters
-        "height_threshold": 2   # 2 meters
+# Guidelines dictionary to hold threshold and references for prefecture and cities
+guidelines = {
+    "Fukuoka Prefecture": {
+        "area_threshold": 500,
+        "height_threshold": 2,
+        "permit_required_text": "宿地造成及び特定盛土等規制法等の手引き 第5条第1項",
+        "no_permit_text": "宿地造成及び特定盛土等規制法等の手引き 第4条",
+        "page_line_info": {
+            "permit": {"page": 12, "line": 5},
+            "no_permit": {"page": 10, "line": 3}
+        },
+        "procedure": "福岡県県土整備部 建筑指导課のホームページ参照。申請書類、計画図面を提出し、審査期間约2週間。"
+    },
+    "大牧田市": {
+        "area_threshold": 500,
+        "height_threshold": 2,
+        "permit_required_text": "大牧田市盛土規制に関する手引き 第3章",
+        "no_permit_text": "大牧田市盛土規制に関する手引き 第2章",
+        "page_line_info": {
+            "permit": {"page": 8, "line": 10},
+            "no_permit": {"page": 5, "line": 4}
+        },
+        "procedure": "大牧田市 建筑指导課で受付。申請構造計算書等を添付し、審査期間は纨3週間。"
     }
 }
 
-def extract_info_from_pdf(uploaded_file):
-    geoname, area, height = None, None, None
+def extract_info_from_pdf(file):
+    geoname = None
+    area = None
+    height = None
     if pdfplumber is None:
         return geoname, area, height
-    # pdfplumber expects a file-like object with 'read' method; Streamlit uploads provide this
-    with pdfplumber.open(uploaded_file) as pdf:
+    with pdfplumber.open(file) as pdf:
         text = ""
         for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+        # Extract geoname
+        for key in ["地名", "所在地", "対象地"]:
+            match = re.search(f"{key}[:：]\s*([^\n]+)", text)
+            if match:
+                geoname = match.group(1).strip()
+                break
+        # Extract area (numbers followed by m2 or ㎡)
+        area_match = re.search(r"([\d,.]+)\s*(?:㎡|m2|m²)", text)
+        if area_match:
             try:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-            except Exception:
-                pass
-    # extract geoname
-    for prefix in ["地名：", "所在地：", "対象地：", "地名:", "所在地:", "対象地:"]:
-        match = re.search(prefix + r"\s*([^\s]+)", text)
-        if match:
-            geoname = match.group(1).strip()
-            break
-    # extract area and height numbers
-    area_match = re.search(r"(?:面積[:：]?)\s*([\d\.]+)", text)
-    if area_match:
-        try:
-            area = float(area_match.group(1))
-        except Exception:
-            area = None
-    height_match = re.search(r"(?:高さ[:：]?)\s*([\d\.]+)", text)
-    if height_match:
-        try:
-            height = float(height_match.group(1))
-        except Exception:
-            height = None
+                area = float(area_match.group(1).replace(',', ''))
+            except ValueError:
+                area = None
+        # Extract height (numbers followed by m)
+        height_match = re.search(r"高さ[:：]?\s*([\d,.]+)\s*m", text)
+        if height_match:
+            try:
+                height = float(height_match.group(1).replace(',', ''))
+            except ValueError:
+                height = None
     return geoname, area, height
 
-def polygon_area(vertices):
-    # compute area of polygon given list of vertices (x,y)
-    if len(vertices) < 3:
-        return 0.0
-    area = 0.0
-    for i in range(len(vertices)):
-        x1, y1 = vertices[i]
-        x2, y2 = vertices[(i + 1) % len(vertices)]
-        area += x1 * y2 - x2 * y1
-    return abs(area) / 2.0
-
-def extract_info_from_dxf(uploaded_file):
-    geoname, area, height = None, None, None
+def extract_info_from_dxf(file):
+    geoname = None
+    area = None
+    height = None
     if ezdxf is None:
         return geoname, area, height
     try:
-        # uploaded_file is file-like; need to read into bytes and load from memory
-        data = uploaded_file.read()
-        doc = ezdxf.readzip(io.BytesIO(data))
-    except Exception:
-        try:
-            uploaded_file.seek(0)
-            doc = ezdxf.readfile(uploaded_file)
-        except Exception:
-            return geoname, area, height
-    msp = doc.modelspace()
-    # compute area from closed polylines
-    largest_area = 0.0
-    for entity in msp:
-        try:
-            if entity.dxftype() in ["LWPOLYLINE", "POLYLINE"]:
-                if hasattr(entity, "is_closed") and not entity.is_closed:
-                    continue
-                pts = [(v[0], v[1]) for v in entity.get_points()]
-                a = polygon_area(pts)
-                if a > largest_area:
-                    largest_area = a
-        except Exception:
-            continue
-        # extract height from text or mtext
-        if entity.dxftype() in ["TEXT", "MTEXT"]:
-            text = entity.text if entity.dxftype() == "TEXT" else entity.plain_text()
-            match = re.search(r"(?:H=|高さ[:：]?)(\d+(?:\.\d+)?)", text)
-            if match:
+        dxf = ezdxf.readfile(file)
+        msp = dxf.modelspace()
+        total_area = 0
+        for entity in msp:
+            if entity.dxftype() in ("HATCH", "LWPOLYLINE", "POLYLINE"):
                 try:
-                    height = float(match.group(1))
+                    if entity.dxftype() == "HATCH":
+                        for path in entity.paths:
+                            total_area += path.polygon.area
+                    else:
+                        if entity.is_closed:
+                            # approximate area for polyline using geometry
+                            pts = []
+                            for v in entity.vertices:
+                                pts.append((v.x, v.y))
+                            if len(pts) > 2:
+                                a = 0
+                                for i in range(len(pts)):
+                                    x1, y1 = pts[i]
+                                    x2, y2 = pts[(i+1) % len(pts)]
+                                    a += x1*y2 - x2*y1
+                                total_area += abs(a) / 2
                 except Exception:
                     pass
-    # convert units to square meters; assume units are in meters; if not, area conversion will be approximate
-    area = largest_area if largest_area > 0 else None
+        if total_area > 0:
+            area = abs(total_area)
+    except Exception:
+        pass
     return geoname, area, height
 
-def evaluate_plan(geoname, area, height):
-    # returns dict with keys: permit_required(bool), improvements(list), category(str)
-    thresholds = GUIDELINES["default"]
-    result = {
-        "permit_required": False,
-        "improvements": [],
-        "category": "許可不要"
-    }
-    if area is None or height is None:
-        # insufficient info
-        result["category"] = "情報不足"
-        return result
-    # Determine category
-    requires_permit = area > thresholds["area_threshold"] or height > thresholds["height_threshold"]
-    if requires_permit:
-        result["permit_required"] = True
-        result["category"] = "許可要"
-        # Suggest improvements to avoid permit
-        if area > thresholds["area_threshold"]:
-            result["improvements"].append(f"面積を {thresholds['area_threshold']}㎡ 未満に縮小してください")
-        if height > thresholds["height_threshold"]:
-            result["improvements"].append(f"高さを {thresholds['height_threshold']}m 未満に抑えてください")
+def evaluate_file(file_name, geoname, area, height):
+    # Determine which guideline to use based on geoname; default to Fukuoka Prefecture
+    guideline_key = "Fukuoka Prefecture"
+    if geoname:
+        if "大牟田" in geoname or "大牟田市" in geoname:
+            guideline_key = "大牟田市"
+    guide = guidelines[guideline_key]
+    status = ""
+    improvements = None
+    reasons = []
+    missing_info = []
+    procedure = ""
+    if not geoname:
+        missing_info.append("地名")
+    if area is None:
+        missing_info.append("面積")
+    if height is None:
+        missing_info.append("高さ")
+    if missing_info:
+        status = "情報不足"
+        improvements = "不足情報を入力して再評価してください。"
+        reasons.append("地名や面積・高さの情報が不足しています")
+        procedure = ""
     else:
-        # Determine if only notification (届出) is needed - simple example
-        result["category"] = "届出要" if area > thresholds["area_threshold"] * 0.8 else "許可不要"
-    return result
+        # Evaluate
+        if area >= guide["area_threshold"] or height >= guide["height_threshold"]:
+            status = "許可申請"
+            reasons.append(f"{guideline_key}の規定で、面積{guide['area_threshold']}㎡以上または高さ{guide['height_threshold']}m以上は許可が必要")
+            refs = guide["page_line_info"]["permit"]
+            reasons.append(f"{guideline_key}資料 {refs['page']}ページ{refs['line']}行: {guide['permit_required_text']}")
+            improvement_list = []
+            if area >= guide["area_threshold"]:
+                improvement_list.append(f"造成面積を{guide['area_threshold']}㎡未満に縮小する")
+            if height >= guide["height_threshold"]:
+                improvement_list.append(f"盛土の高さを{guide['height_threshold']}m未満に抑える")
+            improvements = "、".join(improvement_list) if improvement_list else None
+            procedure = guide["procedure"]
+        else:
+            status = "許可不要"
+            reasons.append(f"{guideline_key}の規定で、面積{guide['area_threshold']}㎡未満かつ高さ{guide['height_threshold']}m未満の場合は許可不要")
+            refs = guide["page_line_info"]["no_permit"]
+            reasons.append(f"{guideline_key}資料 {refs['page']}ページ{refs['line']}行: {guide['no_permit_text']}")
+            improvements = "現計画のまま許可は不要です"
+            procedure = ""
+    return {
+        "file": file_name,
+        "地名": geoname,
+        "面積": area,
+        "高さ": height,
+        "申請区分": status,
+        "改善案": improvements,
+        "理由": " / ".join(reasons),
+        "不足情報": "、".join(missing_info) if missing_info else None,
+        "手続き": procedure
+    }
 
 def generate_reports(results):
-    # results: list of dicts
-    # Generate Excel
     df = pd.DataFrame(results)
     excel_buffer = io.BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
-    excel_data = excel_buffer.getvalue()
-    # Generate PDF using fpdf
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Helvetica", size=12)
-    pdf.multi_cell(0, 8, "盛土規制法 判定レポート\n")
-    for row in results:
-        pdf.multi_cell(0, 8, f"ファイル: {row['file']}")
-        pdf.multi_cell(0, 8, f"地名: {row['地名'] or '不明'}")
-        pdf.multi_cell(0, 8, f"面積: {row['面積'] or '不明'}㎡")
-        pdf.multi_cell(0, 8, f"高さ: {row['高さ'] or '不明'}m")
-        pdf.multi_cell(0, 8, f"判定区分: {row['申請区分']}")
-        if row["不足情報"]:
-            pdf.multi_cell(0, 8, f"不足情報: {row['不足情報']}")
-        if row["改善案"]:
-            pdf.multi_cell(0, 8, f"改善案: {row['改善案']}")
-        pdf.ln(4)
-    pdf_buffer = pdf.output(dest="S").encode("latin-1")
-    return excel_data, pdf_buffer
+        df.to_excel(writer, index=False, sheet_name="判定結果")
+    excel_buffer.seek(0)
+    pdf_buffer = io.BytesIO()
+    doc = SimpleDocTemplate(pdf_buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+    elements = []
+    elements.append(Paragraph("盛土規制法 判定レポート", styles["Title"]))
+    elements.append(Spacer(1, 12))
+    table_data = [list(df.columns)]
+    for _, row in df.iterrows():
+        table_data.append([str(row[col]) if pd.notnull(row[col]) else "" for col in df.columns])
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0), colors.lightblue),
+        ('TEXTCOLOR',(0,0),(-1,0), colors.whitesmoke),
+        ('ALIGN',(0,0),(-1,-1),'CENTER'),
+        ('FONTNAME', (0,0),(-1,-1), "HeiseiMin-W3"),
+        ('FONTSIZE', (0,0),(-1,-1), 8),
+        ('BOX',(0,0),(-1,-1), 0.25, colors.black),
+        ('GRID',(0,0),(-1,-1), 0.25, colors.black),
+    ]))
+    elements.append(table)
+    doc.build(elements)
+    pdf_buffer.seek(0)
+    return excel_buffer.read(), pdf_buffer.read()
 
-st.set_page_config(page_title="盛土規制法 判定ツール（オンライン版）")
-st.title("盛土規制法 判定ツール（オンライン版）")
-st.write("PDFまたはDXFファイルをアップロードすると、盛土規制法に基づく申請要否を自動で判定し、改善案を提示します。")
+# Streamlit application
+def main():
+    st.title("盛土規制法 判定ツール（オンライン版）")
+    st.write("PDFまたはDXFファイルをアップロードすると、盛土規制法に基づく申請要否を自動判定し、改善案を提示します。")
+    uploaded_files = st.file_uploader("ファイルをアップロードしてください（複数可）", type=["pdf","dxf","dwg","jww"], accept_multiple_files=True)
+    if uploaded_files:
+        results = []
+        progress_bar = st.progress(0)
+        total = len(uploaded_files)
+        for idx, uploaded_file in enumerate(uploaded_files):
+            file_name = uploaded_file.name
+            geoname = None
+            area = None
+            height = None
+            if file_name.lower().endswith(".pdf"):
+                geoname, area, height = extract_info_from_pdf(uploaded_file)
+            elif any(file_name.lower().endswith(ext) for ext in [".dxf", ".dwg", ".jww"]):
+                geoname, area, height = extract_info_from_dxf(uploaded_file)
+            with st.expander(f"{file_name} の情報を入力／確認"):
+                if not geoname:
+                    geoname = st.text_input(f"{file_name} の地名を入力してください", key=f"geoname_{idx}") or geoname
+                st.write(f"抽出された地名: {geoname}" if geoname else "地名は未取得です。入力してください。")
+                if area is None or area == 0:
+                    area = st.number_input(f"{file_name} の造成面積(㎡)を入力してください", min_value=0.0, value=0.0, step=0.1, key=f"area_{idx}") or None
+                st.write(f"抽出された面積: {area}㎡" if area else "面積は未取得です。入力してください。")
+                if height is None or height == 0:
+                    height = st.number_input(f"{file_name} の高さ(m)を入力してください", min_value=0.0, value=0.0, step=0.1, key=f"height_{idx}") or None
+                st.write(f"抽出された高さ: {height}m" if height else "高さは未取得です。入力してください。")
+            result = evaluate_file(file_name, geoname, area if area else None, height if height else None)
+            results.append(result)
+            progress_bar.progress((idx + 1)/ total)
+        df = pd.DataFrame(results)
+        st.write("判定結果")
+        st.dataframe(df)
+        excel_data, pdf_data = generate_reports(results)
+        st.download_button("Excelレポートをダウンロード", excel_data, file_name="morido_report.xlsx")
+        st.download_button("PDFレポートをダウンロード", pdf_data, file_name="morido_report.pdf")
+    else:
+        st.info("ファイルをアップロードしてください。")
 
-uploaded_files = st.file_uploader(
-    "ファイルをアップロードしてください（複数可）",
-    type=["pdf", "dxf"],
-    accept_multiple_files=True
-)
-
-if uploaded_files:
-    total = len(uploaded_files)
-    progress_bar = st.progress(0)
-    status_area = st.empty()
-    results = []
-    for idx, uploaded_file in enumerate(uploaded_files, start=1):
-        filename = uploaded_file.name
-        status_area.info(f"{filename} を処理中…")
-        # Determine file type
-        ext = filename.split(".")[-1].lower()
-        geoname, area, height = None, None, None
-        if ext == "pdf":
-            geoname, area, height = extract_info_from_pdf(uploaded_file)
-        elif ext == "dxf":
-            geoname, area, height = extract_info_from_dxf(uploaded_file)
-        eval_res = evaluate_plan(geoname, area, height)
-        result_row = {
-            "file": filename,
-            "地名": geoname,
-            "面積": area,
-            "高さ": height,
-            "申請区分": eval_res["category"],
-            "改善案": "；".join(eval_res["improvements"]) if eval_res["improvements"] else None,
-            "不足情報": None if eval_res["category"] != "情報不足" else "地名や面積・高さの情報が不足しています"
-        }
-        results.append(result_row)
-        # Update progress bar and estimated time
-        progress = idx / total
-        progress_bar.progress(progress)
-        remaining = total - idx
-        status_area.info(f"残りファイル数: {remaining} 件")
-    progress_bar.progress(1.0)
-    status_area.success("処理が完了しました。レポートをダウンロードできます。")
-    # Display results
-    df_results = pd.DataFrame(results)
-    st.dataframe(df_results)
-    # Generate reports
-    excel_data, pdf_data = generate_reports(results)
-    st.download_button("Excelレポートをダウンロード", excel_data, file_name="result.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.download_button("PDFレポートをダウンロード", pdf_data, file_name="result.pdf", mime="application/pdf")
+if __name__ == "__main__":
+    main()
